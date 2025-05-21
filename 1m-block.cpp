@@ -1,7 +1,8 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include <cstdio>        // for FILE, fopen, fclose, printf
+#include <cstdlib>       // for exit, malloc
+#include <cstring>       // for strcmp, strstr, strlen, strncpy, etc.
+#include <csignal>       // for signal, SIGINT
+#include <unistd.h>      // for getopt, optind
 #include <netinet/in.h>
 #include <linux/types.h>
 #include <linux/netfilter.h>
@@ -12,42 +13,57 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <csignal>
-#include <chrono>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <algorithm>
+#include <chrono>        // for std::chrono
+#include <algorithm>     // for std::transform
+#include <netinet/ip.h>     // struct iphdr
+#include <netinet/tcp.h>    // struct tcphdr
 
 bool verbose = false;
 std::unordered_set<std::string> blocked_domains;
 long domains_loaded = 0;
 long blocks_count = 0;
 
+void print_memory_status(const char* label) {
+    FILE* file = fopen("/proc/meminfo", "r");
+    if (!file) {
+        perror("fopen");
+        return;
+    }
+
+    unsigned long memTotal = 0, memFree = 0, buffers = 0, cached = 0;
+    char key[64];
+    unsigned long val;
+    char unit[16];
+
+    while (fscanf(file, "%63s %lu %15s\n", key, &val, unit) == 3) {
+        if (strcmp(key, "MemTotal:") == 0) memTotal = val;
+        else if (strcmp(key, "MemFree:") == 0) memFree = val;
+        else if (strcmp(key, "Buffers:") == 0) buffers = val;
+        else if (strcmp(key, "Cached:") == 0) cached = val;
+    }
+
+    fclose(file);
+
+    unsigned long used = memTotal - memFree - buffers - cached;
+
+    printf("\n[%s]\n", label);
+    printf("🧠 Total RAM  : %10lu KB\n", memTotal);
+    printf("💤 Free RAM   : %10lu KB\n", memFree);
+    printf("📦 Buffers    : %10lu KB\n", buffers);
+    printf("🧊 Cached     : %10lu KB\n", cached);
+    printf("🔥 Used RAM   : %10lu KB\n", used);
+}
+
 void print_usage(const char* prog) {
     printf("Usage: %s [-v] <blocklist_file>\n", prog);
     printf("Options:\n  -v\tVerbose mode\n");
 }
 
-long get_memory_usage_kb() {
-    FILE* file = fopen("/proc/self/status", "r");
-    if (!file) return -1;
-    char line[128];
-    long rss = -1;
-    while (fgets(line, sizeof(line), file)) {
-        if (strncmp(line, "VmRSS:", 6) == 0) {
-            sscanf(line + 6, "%ld", &rss);
-            break;
-        }
-    }
-    fclose(file);
-    return rss;
-}
-
 void sigint_handler(int sig) {
-    printf("\n🛑 Caught SIGINT. Cleaning up...\n");
-    printf("📦 Domains loaded: %ld\n", domains_loaded);
-    printf("⛔ Blocked requests: %ld\n", blocks_count);
-    printf("💾 Memory usage: %ld KB\n", get_memory_usage_kb());
+    printf("\n⚠️ Interrupt received. Cleaning up...\n");
+    printf("📌 Domains loaded: %ld\n", domains_loaded);
+    printf("🚫 Requests blocked: %ld\n", blocks_count);
+    print_memory_status("📉 Final memory state");
     exit(0);
 }
 
@@ -58,6 +74,7 @@ void load_blocklist(const char* filename) {
         std::cerr << "❌ Failed to open file: " << filename << "\n";
         exit(1);
     }
+
     std::string line;
     while (std::getline(file, line)) {
         size_t comma = line.find(',');
@@ -72,8 +89,9 @@ void load_blocklist(const char* filename) {
     file.close();
     auto end = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration<double>(end - start);
-    printf("✅ Blocklist loaded: %ld domains in %.3f seconds\n", domains_loaded, duration.count());
-    printf("💾 Memory usage: %ld KB\n", get_memory_usage_kb());
+    printf("\n📂 Blocklist loaded in %.3f seconds\n", duration.count());
+    printf("📄 Total sites loaded: %ld\n", domains_loaded);
+    print_memory_status("📊 After loading blocklist");
 }
 
 bool extract_host(const unsigned char* http_data, int http_len, std::string& host_out) {
@@ -93,9 +111,7 @@ bool extract_host(const unsigned char* http_data, int http_len, std::string& hos
 }
 
 bool is_http_request(const unsigned char* http) {
-    const char* methods[] = {
-        "GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "CONNECT", "PATCH"
-    };
+    const char* methods[] = {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "CONNECT", "PATCH"};
     for (const char* method : methods) {
         if (strncmp((char*)http, method, strlen(method)) == 0) {
             return true;
@@ -132,10 +148,10 @@ u_int32_t inspect_packet(struct nfq_data* tb, bool& should_block) {
                 double ms = std::chrono::duration<double, std::milli>(end - start).count();
                 if (found) {
                     blocks_count++;
-                    printf("⛔ [BLOCKED %.3f ms] → %s\n", ms, host.c_str());
+                    printf("🚫 BLOCKED [%.3f ms] → %s\n", ms, host.c_str());
                     should_block = true;
                 } else if (verbose) {
-                    printf("✅ [ALLOWED %.3f ms] → %s\n", ms, host.c_str());
+                    printf("✅ ALLOWED [%.3f ms] → %s\n", ms, host.c_str());
                 }
             }
         }
@@ -167,7 +183,7 @@ int main(int argc, char** argv) {
     }
 
     const char* blocklist_file = argv[optind];
-    printf("📂 Loading blocklist: %s\n", blocklist_file);
+    printf("📥 Loading blocklist file: %s\n", blocklist_file);
     load_blocklist(blocklist_file);
 
     struct nfq_handle* h = nfq_open();
@@ -183,7 +199,7 @@ int main(int argc, char** argv) {
 
     int fd = nfq_fd(h);
     char buf[4096] __attribute__((aligned));
-    printf("🧰 Filtering started. Press Ctrl+C to exit.\n");
+    printf("🛡️  Filtering started. Use Ctrl+C to stop.\n");
 
     int rv;
     while ((rv = recv(fd, buf, sizeof(buf), 0)) >= 0) {
@@ -194,7 +210,7 @@ int main(int argc, char** argv) {
     nfq_destroy_queue(qh);
     nfq_close(h);
 
-    printf("👋 Exiting gracefully.\n");
+    printf("👋 Exiting.\n");
     return 0;
 }
 
